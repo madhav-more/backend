@@ -133,3 +133,4 @@ When transactions are created via `/api/transactions/batch`:
 ## License
 
 Private - G.U.R.U POS System
+# pos-backend
