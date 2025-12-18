@@ -1,55 +1,45 @@
 import { v4 as uuidv4 } from 'uuid';
-import pool from '../config/database.js';
+import mongoose from 'mongoose';
+import Transaction from '../models/Transaction.js';
+import User from '../models/User.js';
+import Item from '../models/Item.js';
 
 export const getTransactions = async (req, res) => {
   const { since, from, to, customer_id, payment_type, status } = req.query;
   const userId = req.user.userId;
 
   try {
-    let query = 'SELECT * FROM transactions WHERE user_id = ?';
-    const params = [userId];
+    const query = { user_id: userId };
 
     if (since) {
-      query += ' AND updated_at > ?';
-      params.push(new Date(since));
+      query.updated_at = { $gt: new Date(since) };
     }
 
     if (from) {
-      query += ' AND date >= ?';
-      params.push(new Date(from));
+      query.date = { ...query.date, $gte: new Date(from) };
     }
 
     if (to) {
-      query += ' AND date <= ?';
-      params.push(new Date(to));
+      query.date = { ...query.date, $lte: new Date(to) };
     }
 
     if (customer_id) {
-      query += ' AND customer_id = ?';
-      params.push(customer_id);
+      query.customer_id = customer_id;
     }
 
     if (payment_type) {
-      query += ' AND payment_type = ?';
-      params.push(payment_type);
+      query.payment_type = payment_type;
     }
 
     if (status) {
-      query += ' AND status = ?';
-      params.push(status);
+      query.status = status;
     }
 
-    query += ' ORDER BY date DESC';
+    const transactions = await Transaction.find(query).sort({ date: -1 });
 
-    const [transactions] = await pool.query(query, params);
+    // toJSON transform automatically converts _id to id and line_items to lines
 
-    // Map line_items back to lines
-    const formattedTransactions = transactions.map(tx => ({
-      ...tx,
-      lines: tx.line_items ? JSON.parse(tx.line_items) : []
-    }));
-
-    res.json({ transactions: formattedTransactions });
+    res.json({ transactions });
   } catch (error) {
     console.error('Get transactions error:', error);
     res.status(500).json({ error: 'Failed to fetch transactions' });
@@ -64,9 +54,11 @@ export const createTransactionsBatch = async (req, res) => {
     return res.status(400).json({ error: 'Transactions array is required' });
   }
 
-  const connection = await pool.getConnection();
+  // Start a session for atomic operations
+  const session = await mongoose.startSession();
+
   try {
-    await connection.beginTransaction();
+    await session.startTransaction();
 
     const results = {
       synced: [],
@@ -77,16 +69,16 @@ export const createTransactionsBatch = async (req, res) => {
       try {
         // 1. Check for idempotency key
         if (transaction.idempotency_key) {
-          const [existingIdempotency] = await connection.query(
-            'SELECT id, voucher_number FROM transactions WHERE user_id = ? AND idempotency_key = ?',
-            [userId, transaction.idempotency_key]
-          );
+          const existingIdempotency = await Transaction.findOne({
+            user_id: userId,
+            idempotency_key: transaction.idempotency_key
+          }).session(session);
 
-          if (existingIdempotency.length > 0) {
+          if (existingIdempotency) {
             results.synced.push({
               id: transaction.id,
-              cloud_id: existingIdempotency[0].id,
-              voucher_number: existingIdempotency[0].voucher_number
+              cloud_id: existingIdempotency._id,
+              voucher_number: existingIdempotency.voucher_number
             });
             continue;
           }
@@ -99,18 +91,18 @@ export const createTransactionsBatch = async (req, res) => {
           const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
 
           // Get user company code
-          const [users] = await connection.query('SELECT company FROM users WHERE id = ?', [userId]);
-          const companyCode = users[0]?.company?.substring(0, 3).toUpperCase() || 'GUR';
+          const user = await User.findById(userId).session(session);
+          const companyCode = user?.company?.substring(0, 3).toUpperCase() || 'GUR';
 
           // Get sequence
-          const [lastTx] = await connection.query(
-            'SELECT voucher_number FROM transactions WHERE user_id = ? AND voucher_number LIKE ? ORDER BY voucher_number DESC LIMIT 1',
-            [userId, `%-${dateStr}-%`]
-          );
+          const lastTx = await Transaction.findOne({
+            user_id: userId,
+            voucher_number: { $regex: new RegExp(`-${dateStr}-`) }
+          }).sort({ voucher_number: -1 }).session(session);
 
           let sequence = 1;
-          if (lastTx.length > 0) {
-            const lastVoucher = lastTx[0].voucher_number;
+          if (lastTx) {
+            const lastVoucher = lastTx.voucher_number;
             const lastSeq = parseInt(lastVoucher.split('-').pop());
             sequence = lastSeq + 1;
           }
@@ -120,32 +112,37 @@ export const createTransactionsBatch = async (req, res) => {
 
         // 3. Create Transaction
         const transactionId = transaction.id || uuidv4();
-        const linesJson = JSON.stringify(transaction.lines || []);
+        const newTransaction = await Transaction.create([{
+          _id: transactionId,
+          user_id: userId,
+          customer_id: transaction.customer_id,
+          voucher_number: voucherNumber,
+          provisional_voucher: null,
+          date: new Date(transaction.date || Date.now()),
+          subtotal: transaction.subtotal,
+          tax: transaction.tax,
+          discount: transaction.discount,
+          other_charges: transaction.other_charges,
+          grand_total: transaction.grand_total,
+          item_count: transaction.item_count,
+          unit_count: transaction.unit_count,
+          payment_type: transaction.payment_type,
+          status: transaction.status,
+          receipt_path: transaction.receipt_path,
+          idempotency_key: transaction.idempotency_key,
+          line_items: transaction.lines || [],
+          created_at: new Date(transaction.created_at || Date.now()),
+          updated_at: new Date(transaction.updated_at || Date.now())
+        }], { session });
 
-        await connection.query(
-          `INSERT INTO transactions (
-            id, user_id, customer_id, voucher_number, provisional_voucher, 
-            date, subtotal, tax, discount, other_charges, grand_total, 
-            item_count, unit_count, payment_type, status, receipt_path, 
-            idempotency_key, line_items, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            transactionId, userId, transaction.customer_id, voucherNumber, null,
-            new Date(transaction.date || Date.now()), transaction.subtotal, transaction.tax, transaction.discount, transaction.other_charges, transaction.grand_total,
-            transaction.item_count, transaction.unit_count, transaction.payment_type, transaction.status, transaction.receipt_path,
-            transaction.idempotency_key, linesJson,
-            new Date(transaction.created_at || Date.now()),
-            new Date(transaction.updated_at || Date.now())
-          ]
-        );
-
-        // 4. Update Inventory
+        // 4. Update Inventory (atomic)
         if (transaction.lines && Array.isArray(transaction.lines)) {
           for (const line of transaction.lines) {
             if (line.item_id) {
-              await connection.query(
-                'UPDATE items SET inventory_qty = inventory_qty - ? WHERE id = ? AND user_id = ?',
-                [line.quantity || 0, line.item_id, userId]
+              await Item.updateOne(
+                { _id: line.item_id, user_id: userId },
+                { $inc: { inventory_qty: -(line.quantity || 0) } },
+                { session }
               );
             }
           }
@@ -163,15 +160,15 @@ export const createTransactionsBatch = async (req, res) => {
       }
     }
 
-    await connection.commit();
+    await session.commitTransaction();
     res.json(results);
 
   } catch (error) {
-    await connection.rollback();
+    await session.abortTransaction();
     console.error('Batch create transactions error:', error);
     res.status(500).json({ error: 'Failed to sync transactions' });
   } finally {
-    connection.release();
+    session.endSession();
   }
 };
 
@@ -181,30 +178,27 @@ export const updateTransaction = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const fields = [];
-    const values = [];
-    const allowedFields = ['status', 'receipt_path']; // Only allow updating specific fields
+    const allowedFields = ['status', 'receipt_path'];
+    const updateData = {};
 
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {
-        fields.push(`${field} = ?`);
-        values.push(updates[field]);
+        updateData[field] = updates[field];
       }
     }
 
-    if (fields.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    fields.push('updated_at = NOW()');
-    values.push(id);
-    values.push(userId);
+    updateData.updated_at = new Date();
 
-    const query = `UPDATE transactions SET ${fields.join(', ')} WHERE id = ? AND user_id = ?`;
+    const result = await Transaction.updateOne(
+      { _id: id, user_id: userId },
+      { $set: updateData }
+    );
 
-    const [result] = await pool.query(query, values);
-
-    if (result.affectedRows === 0) {
+    if (result.matchedCount === 0) {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 
@@ -220,9 +214,9 @@ export const deleteTransaction = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const [result] = await pool.query('DELETE FROM transactions WHERE id = ? AND user_id = ?', [id, userId]);
+    const result = await Transaction.deleteOne({ _id: id, user_id: userId });
 
-    if (result.affectedRows === 0) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 

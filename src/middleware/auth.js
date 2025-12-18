@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import pool from '../config/database.js';
+import TokenBlacklist from '../models/TokenBlacklist.js';
 
 export const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -11,8 +11,8 @@ export const authenticateToken = async (req, res, next) => {
 
   try {
     // Check if token is blacklisted
-    const [blacklisted] = await pool.query('SELECT token FROM token_blacklist WHERE token = ?', [token]);
-    if (blacklisted.length > 0) {
+    const blacklisted = await TokenBlacklist.findOne({ token });
+    if (blacklisted) {
       return res.status(403).json({ error: 'Token has been invalidated' });
     }
 

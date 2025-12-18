@@ -1,4 +1,4 @@
-import pool from '../config/database.js';
+import Transaction from '../models/Transaction.js';
 
 export const initDailyVouchers = async (req, res) => {
   const { company_code, date, user_id } = req.body;
@@ -13,14 +13,14 @@ export const initDailyVouchers = async (req, res) => {
     const dateStr = date;
     const prefix = `${company_code}-${dateStr}`;
 
-    const [transactions] = await pool.query(
-      'SELECT voucher_number FROM transactions WHERE user_id = ? AND voucher_number LIKE ? ORDER BY voucher_number DESC LIMIT 1',
-      [user_id, `${prefix}-%`]
-    );
+    const lastTransaction = await Transaction.findOne({
+      user_id,
+      voucher_number: { $regex: new RegExp(`^${prefix}-`) }
+    }).sort({ voucher_number: -1 });
 
     let nextSequence = 1;
-    if (transactions.length > 0) {
-      const lastVoucher = transactions[0].voucher_number;
+    if (lastTransaction) {
+      const lastVoucher = lastTransaction.voucher_number;
       const match = lastVoucher.match(/-(\d+)$/);
       if (match) {
         nextSequence = parseInt(match[1]) + 1;
@@ -53,12 +53,12 @@ export const generateVoucherNumber = async (req, res) => {
   try {
     const voucher_number = `${company_code}-${date}-${sequence}`;
 
-    const [existing] = await pool.query(
-      'SELECT id FROM transactions WHERE user_id = ? AND voucher_number = ?',
-      [userId, voucher_number]
-    );
+    const existing = await Transaction.findOne({
+      user_id: userId,
+      voucher_number
+    });
 
-    if (existing.length > 0) {
+    if (existing) {
       return res.status(409).json({
         error: 'Voucher number already exists',
         voucher_number,
@@ -90,12 +90,12 @@ export const confirmVoucherNumber = async (req, res) => {
   }
 
   try {
-    const [result] = await pool.query(
-      'UPDATE transactions SET voucher_number = ?, provisional_voucher = NULL, updated_at = NOW() WHERE id = ? AND user_id = ?',
-      [voucher_number, transaction_id, userId]
+    const result = await Transaction.updateOne(
+      { _id: transaction_id, user_id: userId },
+      { $set: { voucher_number, provisional_voucher: null, updated_at: new Date() } }
     );
 
-    if (result.affectedRows === 0) {
+    if (result.matchedCount === 0) {
       return res.status(404).json({ error: 'Transaction not found' });
     }
 

@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import pool from '../config/database.js';
+import Customer from '../models/Customer.js';
 
 /**
  * Search customers with autosuggest functionality
@@ -19,22 +19,18 @@ export const searchCustomers = async (req, res) => {
       return res.json({ customers: [] });
     }
 
-    // Build dynamic SQL query
-    let sql = 'SELECT * FROM customers WHERE user_id = ? AND (';
-    const params = [userId];
-
+    // Build regex query for flexible search
     const orConditions = [];
     searchFields.forEach(field => {
       searchTerms.forEach(term => {
-        orConditions.push(`${field} LIKE ?`);
-        params.push(`%${term}%`);
+        orConditions.push({ [field]: { $regex: term, $options: 'i' } });
       });
     });
 
-    sql += orConditions.join(' OR ') + ') LIMIT ?';
-    params.push(limit * 2);
-
-    const [customers] = await pool.query(sql, params);
+    const customers = await Customer.find({
+      user_id: userId,
+      $or: orConditions
+    }).limit(limit * 2).lean();
 
     // Calculate relevance scores
     const scoredCustomers = customers.map(customer => {
@@ -78,23 +74,21 @@ export const getCustomers = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    let query = 'SELECT * FROM customers WHERE user_id = ?';
-    const params = [userId];
+    const query = { user_id: userId };
 
     if (since) {
-      query += ' AND updated_at > ?';
-      params.push(new Date(since));
+      query.updated_at = { $gt: new Date(since) };
     }
 
     if (search) {
-      query += ' AND (name LIKE ? OR phone LIKE ? OR email LIKE ?)';
-      const searchParam = `%${search}%`;
-      params.push(searchParam, searchParam, searchParam);
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } }
+      ];
     }
 
-    query += ' ORDER BY updated_at ASC';
-
-    const [customers] = await pool.query(query, params);
+    const customers = await Customer.find(query).sort({ updated_at: 1 });
 
     res.json({ customers });
   } catch (error) {
@@ -111,10 +105,7 @@ export const batchUpsertCustomers = async (req, res) => {
     return res.status(400).json({ error: 'Customers array is required' });
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     const results = {
       synced: [],
       conflicts: []
@@ -123,59 +114,56 @@ export const batchUpsertCustomers = async (req, res) => {
     for (const customer of customers) {
       try {
         if (customer.idempotency_key) {
-          const [existingIdempotency] = await connection.query(
-            'SELECT id FROM customers WHERE user_id = ? AND idempotency_key = ?',
-            [userId, customer.idempotency_key]
-          );
+          const existingIdempotency = await Customer.findOne({
+            user_id: userId,
+            idempotency_key: customer.idempotency_key
+          });
 
-          if (existingIdempotency.length > 0) {
+          if (existingIdempotency) {
             results.synced.push({
               id: customer.id,
-              cloud_id: existingIdempotency[0].id
+              cloud_id: existingIdempotency._id
             });
             continue;
           }
         }
 
         const customerId = customer.id || uuidv4();
-
-        const [existingCustomers] = await connection.query(
-          'SELECT * FROM customers WHERE user_id = ? AND id = ?',
-          [userId, customerId]
-        );
-
-        const existingCustomer = existingCustomers[0];
+        const existingCustomer = await Customer.findOne({
+          _id: customerId,
+          user_id: userId
+        });
 
         if (existingCustomer) {
           const clientUpdatedAt = new Date(customer.updated_at || Date.now());
           const serverUpdatedAt = new Date(existingCustomer.updated_at);
 
           if (clientUpdatedAt > serverUpdatedAt) {
-            await connection.query(
-              `UPDATE customers SET 
-                name = ?, phone = ?, email = ?, address = ?, 
-                updated_at = ?
-               WHERE id = ? AND user_id = ?`,
-              [
-                customer.name, customer.phone, customer.email, customer.address,
-                clientUpdatedAt,
-                customerId, userId
-              ]
+            await Customer.updateOne(
+              { _id: customerId, user_id: userId },
+              {
+                $set: {
+                  name: customer.name,
+                  phone: customer.phone,
+                  email: customer.email,
+                  address: customer.address,
+                  updated_at: clientUpdatedAt
+                }
+              }
             );
           }
         } else {
-          await connection.query(
-            `INSERT INTO customers (
-              id, user_id, name, phone, email, address, 
-              idempotency_key, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              customerId, userId, customer.name, customer.phone, customer.email, customer.address,
-              customer.idempotency_key,
-              new Date(customer.created_at || Date.now()),
-              new Date(customer.updated_at || Date.now())
-            ]
-          );
+          await Customer.create({
+            _id: customerId,
+            user_id: userId,
+            name: customer.name,
+            phone: customer.phone,
+            email: customer.email,
+            address: customer.address,
+            idempotency_key: customer.idempotency_key,
+            created_at: new Date(customer.created_at || Date.now()),
+            updated_at: new Date(customer.updated_at || Date.now())
+          });
         }
 
         results.synced.push({
@@ -189,15 +177,11 @@ export const batchUpsertCustomers = async (req, res) => {
       }
     }
 
-    await connection.commit();
     res.json(results);
 
   } catch (error) {
-    await connection.rollback();
     console.error('Batch upsert customers error:', error);
     res.status(500).json({ error: 'Failed to sync customers' });
-  } finally {
-    connection.release();
   }
 };
 
@@ -207,33 +191,27 @@ export const updateCustomer = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const [existing] = await pool.query('SELECT id FROM customers WHERE id = ? AND user_id = ?', [id, userId]);
-    if (existing.length === 0) {
+    const existing = await Customer.findOne({ _id: id, user_id: userId });
+    if (!existing) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const fields = [];
-    const values = [];
     const allowedFields = ['name', 'phone', 'email', 'address'];
+    const updateData = {};
 
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {
-        fields.push(`${field} = ?`);
-        values.push(updates[field]);
+        updateData[field] = updates[field];
       }
     }
 
-    if (fields.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    fields.push('updated_at = NOW()');
-    values.push(id);
-    values.push(userId);
+    updateData.updated_at = new Date();
 
-    const query = `UPDATE customers SET ${fields.join(', ')} WHERE id = ? AND user_id = ?`;
-
-    await pool.query(query, values);
+    await Customer.updateOne({ _id: id, user_id: userId }, { $set: updateData });
 
     res.json({ success: true, message: 'Customer updated successfully' });
   } catch (error) {
@@ -247,9 +225,9 @@ export const deleteCustomer = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const [result] = await pool.query('DELETE FROM customers WHERE id = ? AND user_id = ?', [id, userId]);
+    const result = await Customer.deleteOne({ _id: id, user_id: userId });
 
-    if (result.affectedRows === 0) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 

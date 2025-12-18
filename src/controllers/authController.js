@@ -1,7 +1,8 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
-import pool from '../config/database.js';
+import User from '../models/User.js';
+import TokenBlacklist from '../models/TokenBlacklist.js';
 
 export const signup = async (req, res) => {
   const { name, email, password, company, location } = req.body;
@@ -12,21 +13,25 @@ export const signup = async (req, res) => {
 
   try {
     // Check if user exists
-    const [existingUsers] = await pool.query('SELECT _id FROM users WHERE email = ?', [email]);
-    if (existingUsers.length > 0) {
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
       return res.status(409).json({ error: 'User with this email already exists' });
     }
 
     const password_hash = await bcrypt.hash(password, 10);
     const userId = uuidv4();
 
-    await pool.query(
-      'INSERT INTO users (_id, name, email, password_hash, company, location) VALUES (?, ?, ?, ?, ?, ?)',
-      [userId, name, email, password_hash, company, location]
-    );
+    const newUser = await User.create({
+      _id: userId,
+      name,
+      email: email.toLowerCase(),
+      password_hash,
+      company,
+      location
+    });
 
     const token = jwt.sign(
-      { userId, email },
+      { userId: newUser._id, email: newUser.email },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -34,16 +39,20 @@ export const signup = async (req, res) => {
     res.status(201).json({
       token,
       user: {
-        id: userId,
-        name,
-        email,
-        company,
-        location,
-        company_code: company?.substring(0, 3).toUpperCase() || 'GUR'
+        id: newUser._id,
+        name: newUser.name,
+        email: newUser.email,
+        company: newUser.company,
+        location: newUser.location,
+        company_code: newUser.company?.substring(0, 3).toUpperCase() || 'GUR'
       }
     });
   } catch (error) {
     console.error('Signup error:', error);
+    // Handle MongoDB duplicate key error
+    if (error.code === 11000) {
+      return res.status(409).json({ error: 'User with this email already exists' });
+    }
     res.status(500).json({ error: 'Failed to create user' });
   }
 };
@@ -56,8 +65,7 @@ export const login = async (req, res) => {
   }
 
   try {
-    const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-    const user = users[0];
+    const user = await User.findOne({ email: email.toLowerCase() });
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -93,8 +101,7 @@ export const login = async (req, res) => {
 
 export const validateToken = async (req, res) => {
   try {
-    const [users] = await pool.query('SELECT * FROM users WHERE _id = ?', [req.user.userId]);
-    const user = users[0];
+    const user = await User.findById(req.user.userId);
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -119,8 +126,7 @@ export const validateToken = async (req, res) => {
 
 export const refreshToken = async (req, res) => {
   try {
-    const [users] = await pool.query('SELECT * FROM users WHERE _id = ?', [req.user.userId]);
-    const user = users[0];
+    const user = await User.findById(req.user.userId);
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -159,12 +165,12 @@ export const logout = async (req, res) => {
   try {
     // Decode token to get expiration
     const decoded = jwt.decode(token);
-    const expiresAt = decoded ? new Date(decoded.exp * 1000) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // Default 7 days if decode fails
+    const expiresAt = decoded ? new Date(decoded.exp * 1000) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-    await pool.query(
-      'INSERT INTO token_blacklist (token, expires_at) VALUES (?, ?)',
-      [token, expiresAt]
-    );
+    await TokenBlacklist.create({
+      token,
+      expires_at: expiresAt
+    });
 
     console.log(`User ${req.user.userId} logged out`);
     res.json({

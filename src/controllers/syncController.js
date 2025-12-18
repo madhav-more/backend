@@ -1,6 +1,15 @@
 import { v4 as uuidv4 } from 'uuid';
-import pool from '../config/database.js';
+import mongoose from 'mongoose';
+import Item from '../models/Item.js';
+import Customer from '../models/Customer.js';
+import Transaction from '../models/Transaction.js';
+import User from '../models/User.js';
+import SyncMetadata from '../models/SyncMetadata.js';
 
+/**
+ * Pull changes from server (cloud → local)
+ * Returns all records updated after the 'since' timestamp
+ */
 export const pullChanges = async (req, res) => {
   const { since } = req.body;
   const userId = req.user.userId;
@@ -8,55 +17,51 @@ export const pullChanges = async (req, res) => {
   try {
     const sinceDate = since ? new Date(since) : new Date(0);
 
-    const [items] = await pool.query(
-      'SELECT * FROM items WHERE user_id = ? AND updatedAt > ? ORDER BY updatedAt ASC',
-      [userId, sinceDate]
-    );
+    // Fetch items (including soft-deleted ones)
+    const items = await Item.find({
+      user_id: userId,
+      updated_at: { $gt: sinceDate }
+    }).sort({ updated_at: 1 });
 
-    const [customers] = await pool.query(
-      'SELECT * FROM customers WHERE user_id = ? AND updatedAt > ? ORDER BY updatedAt ASC',
-      [userId, sinceDate]
-    );
+    // Fetch customers
+    const customers = await Customer.find({
+      user_id: userId,
+      updated_at: { $gt: sinceDate }
+    }).sort({ updated_at: 1 });
 
-    const [transactions] = await pool.query(
-      'SELECT * FROM transactions WHERE user_id = ? AND updatedAt > ? ORDER BY updatedAt ASC',
-      [userId, sinceDate]
-    );
+    // Fetch transactions with line items
+    const transactions = await Transaction.find({
+      user_id: userId,
+      updated_at: { $gt: sinceDate }
+    }).sort({ updated_at: 1 });
 
-    // Map DB fields to API fields if needed
-    const mapFields = (records) => records.map(r => {
-      const { _id, ...rest } = r;
-      return { id: _id, ...rest };
-    });
-
-    const formattedTransactions = transactions.map(tx => {
-      const { _id, lines, ...rest } = tx;
-      return {
-        id: _id,
-        ...rest,
-        lines: lines || [] // lines is JSON in DB
-      };
-    });
+    // toJSON transform will automatically handle _id -> id and line_items -> lines
 
     res.json({
-      items: mapFields(items).map(i => ({ ...i, image_path: i.image_url })), // Map back for frontend compat if needed, or update frontend
-      customers: mapFields(customers),
-      transactions: formattedTransactions,
+      items,
+      customers,
+      transactions,
       server_timestamp: new Date().toISOString()
     });
   } catch (error) {
     console.error('Pull changes error:', error);
-    res.status(500).json({ error: 'Failed to pull changes' });
+    res.status(500).json({ error: 'Failed to pull changes', message: error.message });
   }
 };
 
+/**
+ * Push changes from client (local → cloud)
+ * Handles CREATE, UPDATE, and DELETE operations with conflict resolution
+ */
 export const pushChanges = async (req, res) => {
   const { items, customers, transactions } = req.body;
   const userId = req.user.userId;
 
-  const connection = await pool.getConnection();
+  // Start a session for atomic operations
+  const session = await mongoose.startSession();
+
   try {
-    await connection.beginTransaction();
+    await session.startTransaction();
 
     const results = {
       items: { synced: [], conflicts: [] },
@@ -64,194 +69,305 @@ export const pushChanges = async (req, res) => {
       transactions: { synced: [], conflicts: [] }
     };
 
-    // Process items
+    // ==================== PROCESS ITEMS ====================
     if (items && Array.isArray(items)) {
+      console.log(`Processing ${items.length} items for sync`);
       for (const item of items) {
         try {
-          if (item.idempotency_key) {
-            const [existingIdempotency] = await connection.query(
-              'SELECT _id FROM items WHERE user_id = ? AND idempotency_key = ?',
-              [userId, item.idempotency_key]
+          console.log(`Syncing item: ${item.name}, Price: ${item.price}, ID: ${item.id}`);
+
+          // Handle deletion
+          if (item.deleted_at) {
+            const result = await Item.updateOne(
+              { _id: item.id, user_id: userId },
+              { $set: { deleted_at: new Date(item.deleted_at), updated_at: new Date() } },
+              { session }
             );
-            if (existingIdempotency.length > 0) {
-              results.items.synced.push({ id: item.id, cloud_id: existingIdempotency[0]._id });
+
+            if (result.modifiedCount > 0) {
+              results.items.synced.push({ id: item.id, cloud_id: item.id, deleted: true });
+            }
+            continue;
+          }
+
+          // Check for idempotency
+          if (item.idempotency_key) {
+            const existingIdempotency = await Item.findOne({
+              user_id: userId,
+              idempotency_key: item.idempotency_key,
+              deleted_at: null
+            }).session(session);
+
+            if (existingIdempotency) {
+              results.items.synced.push({ id: item.id, cloud_id: existingIdempotency._id });
               continue;
             }
           }
 
           const itemId = item.id || uuidv4();
-          const [existingItems] = await connection.query('SELECT * FROM items WHERE user_id = ? AND _id = ?', [userId, itemId]);
-          const existingItem = existingItems[0];
+          const existingItem = await Item.findOne({
+            _id: itemId,
+            user_id: userId,
+            deleted_at: null
+          }).session(session);
 
           if (existingItem) {
+            // UPDATE existing item
             const clientUpdatedAt = new Date(item.updated_at || Date.now());
-            const serverUpdatedAt = new Date(existingItem.updatedAt);
+            const serverUpdatedAt = new Date(existingItem.updated_at);
 
-            if (clientUpdatedAt > serverUpdatedAt) {
-              await connection.query(
-                `UPDATE items SET 
-                  name = ?, barcode = ?, sku = ?, price = ?, unit = ?, 
-                  inventory_qty = ?, category = ?, recommended = ?, image_url = ?, 
-                  updatedAt = ?
-                 WHERE _id = ? AND user_id = ?`,
-                [
-                  item.name, item.barcode, item.sku, item.price, item.unit,
-                  item.inventory_qty, item.category, item.recommended, item.image_path || item.image_url,
-                  clientUpdatedAt,
-                  itemId, userId
-                ]
+            // Conflict resolution: last-write-wins based on updated_at
+            if (clientUpdatedAt >= serverUpdatedAt) {
+              await Item.updateOne(
+                { _id: itemId, user_id: userId },
+                {
+                  $set: {
+                    name: item.name,
+                    barcode: item.barcode || null,
+                    sku: item.sku || null,
+                    price: item.price || 0,
+                    unit: item.unit || 'piece',
+                    inventory_qty: item.inventory_qty || 0,
+                    category: item.category || null,
+                    recommended: item.recommended || false,
+                    image_path: item.image_path || item.image_url || null,
+                    updated_at: clientUpdatedAt,
+                    deleted_at: null
+                  }
+                },
+                { session }
               );
+              results.items.synced.push({ id: item.id, cloud_id: itemId, action: 'updated' });
+            } else {
+              // Server version is newer - conflict
+              results.items.conflicts.push({
+                id: item.id,
+                reason: 'Server version is newer',
+                server_updated_at: serverUpdatedAt,
+                client_updated_at: clientUpdatedAt
+              });
             }
           } else {
-            await connection.query(
-              `INSERT INTO items (
-                _id, user_id, name, barcode, sku, price, unit, 
-                inventory_qty, category, recommended, image_url, 
-                idempotency_key, createdAt, updatedAt
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                itemId, userId, item.name, item.barcode, item.sku, item.price, item.unit,
-                item.inventory_qty, item.category, item.recommended, item.image_path || item.image_url,
-                item.idempotency_key,
-                new Date(item.created_at || Date.now()),
-                new Date(item.updated_at || Date.now())
-              ]
-            );
+            // CREATE new item
+            await Item.create([{
+              _id: itemId,
+              user_id: userId,
+              name: item.name,
+              barcode: item.barcode || null,
+              sku: item.sku || null,
+              price: item.price || 0,
+              unit: item.unit || 'piece',
+              inventory_qty: item.inventory_qty || 0,
+              category: item.category || null,
+              recommended: item.recommended || false,
+              image_path: item.image_path || item.image_url || null,
+              idempotency_key: item.idempotency_key || `item-${itemId}`,
+              created_at: new Date(item.created_at || Date.now()),
+              updated_at: new Date(item.updated_at || Date.now())
+            }], { session });
+            results.items.synced.push({ id: item.id, cloud_id: itemId, action: 'created' });
           }
-          results.items.synced.push({ id: item.id, cloud_id: itemId });
         } catch (err) {
+          console.error('Item sync error:', err);
           results.items.conflicts.push({ id: item.id, error: err.message });
         }
       }
     }
 
-    // Process customers
+    // ==================== PROCESS CUSTOMERS ====================
     if (customers && Array.isArray(customers)) {
       for (const customer of customers) {
         try {
-          if (customer.idempotency_key) {
-            const [existingIdempotency] = await connection.query(
-              'SELECT _id FROM customers WHERE user_id = ? AND idempotency_key = ?',
-              [userId, customer.idempotency_key]
+          // Handle deletion
+          if (customer.deleted_at) {
+            const result = await Customer.updateOne(
+              { _id: customer.id, user_id: userId },
+              { $set: { deleted_at: new Date(customer.deleted_at), updated_at: new Date() } },
+              { session }
             );
-            if (existingIdempotency.length > 0) {
-              results.customers.synced.push({ id: customer.id, cloud_id: existingIdempotency[0]._id });
+
+            if (result.modifiedCount > 0) {
+              results.customers.synced.push({ id: customer.id, cloud_id: customer.id, deleted: true });
+            }
+            continue;
+          }
+
+          // Check for idempotency
+          if (customer.idempotency_key) {
+            const existingIdempotency = await Customer.findOne({
+              user_id: userId,
+              idempotency_key: customer.idempotency_key,
+              deleted_at: null
+            }).session(session);
+
+            if (existingIdempotency) {
+              results.customers.synced.push({ id: customer.id, cloud_id: existingIdempotency._id });
               continue;
             }
           }
 
           const customerId = customer.id || uuidv4();
-          const [existingCustomers] = await connection.query('SELECT * FROM customers WHERE user_id = ? AND _id = ?', [userId, customerId]);
-          const existingCustomer = existingCustomers[0];
+          const existingCustomer = await Customer.findOne({
+            _id: customerId,
+            user_id: userId,
+            deleted_at: null
+          }).session(session);
 
           if (existingCustomer) {
+            // UPDATE existing customer
             const clientUpdatedAt = new Date(customer.updated_at || Date.now());
-            const serverUpdatedAt = new Date(existingCustomer.updatedAt);
+            const serverUpdatedAt = new Date(existingCustomer.updated_at);
 
-            if (clientUpdatedAt > serverUpdatedAt) {
-              await connection.query(
-                `UPDATE customers SET 
-                  name = ?, phone = ?, email = ?, address = ?, 
-                  updatedAt = ?
-                 WHERE _id = ? AND user_id = ?`,
-                [
-                  customer.name, customer.phone, customer.email, customer.address,
-                  clientUpdatedAt,
-                  customerId, userId
-                ]
+            if (clientUpdatedAt >= serverUpdatedAt) {
+              await Customer.updateOne(
+                { _id: customerId, user_id: userId },
+                {
+                  $set: {
+                    name: customer.name,
+                    phone: customer.phone || null,
+                    email: customer.email || null,
+                    address: customer.address || null,
+                    updated_at: clientUpdatedAt,
+                    deleted_at: null
+                  }
+                },
+                { session }
               );
+              results.customers.synced.push({ id: customer.id, cloud_id: customerId, action: 'updated' });
+            } else {
+              results.customers.conflicts.push({
+                id: customer.id,
+                reason: 'Server version is newer'
+              });
             }
           } else {
-            await connection.query(
-              `INSERT INTO customers (
-                _id, user_id, name, phone, email, address, 
-                idempotency_key, createdAt, updatedAt
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                customerId, userId, customer.name, customer.phone, customer.email, customer.address,
-                customer.idempotency_key,
-                new Date(customer.created_at || Date.now()),
-                new Date(customer.updated_at || Date.now())
-              ]
-            );
+            // CREATE new customer
+            await Customer.create([{
+              _id: customerId,
+              user_id: userId,
+              name: customer.name,
+              phone: customer.phone || null,
+              email: customer.email || null,
+              address: customer.address || null,
+              idempotency_key: customer.idempotency_key || `customer-${customerId}`,
+              created_at: new Date(customer.created_at || Date.now()),
+              updated_at: new Date(customer.updated_at || Date.now())
+            }], { session });
+            results.customers.synced.push({ id: customer.id, cloud_id: customerId, action: 'created' });
           }
-          results.customers.synced.push({ id: customer.id, cloud_id: customerId });
         } catch (err) {
+          console.error('Customer sync error:', err);
           results.customers.conflicts.push({ id: customer.id, error: err.message });
         }
       }
     }
 
-    // Process transactions
+    // ==================== PROCESS TRANSACTIONS ====================
     if (transactions && Array.isArray(transactions)) {
       for (const transaction of transactions) {
         try {
-          if (transaction.idempotency_key) {
-            const [existingIdempotency] = await connection.query(
-              'SELECT _id, voucher_number FROM transactions WHERE user_id = ? AND idempotency_key = ?',
-              [userId, transaction.idempotency_key]
+          // Handle deletion
+          if (transaction.deleted_at) {
+            const result = await Transaction.updateOne(
+              { _id: transaction.id, user_id: userId },
+              { $set: { deleted_at: new Date(transaction.deleted_at), updated_at: new Date() } },
+              { session }
             );
-            if (existingIdempotency.length > 0) {
+
+            if (result.modifiedCount > 0) {
+              results.transactions.synced.push({ id: transaction.id, cloud_id: transaction.id, deleted: true });
+            }
+            continue;
+          }
+
+          // Check for idempotency
+          if (transaction.idempotency_key) {
+            const existingIdempotency = await Transaction.findOne({
+              user_id: userId,
+              idempotency_key: transaction.idempotency_key,
+              deleted_at: null
+            }).session(session);
+
+            if (existingIdempotency) {
               results.transactions.synced.push({
                 id: transaction.id,
-                cloud_id: existingIdempotency[0]._id,
-                voucher_number: existingIdempotency[0].voucher_number
+                cloud_id: existingIdempotency._id,
+                voucher_number: existingIdempotency.voucher_number
               });
               continue;
             }
           }
 
           const transactionId = transaction.id || uuidv4();
-          const [existingTx] = await connection.query('SELECT * FROM transactions WHERE user_id = ? AND _id = ?', [userId, transactionId]);
+          const existingTx = await Transaction.findOne({
+            _id: transactionId,
+            user_id: userId,
+            deleted_at: null
+          }).session(session);
 
-          if (existingTx.length > 0) {
-            const existingTransaction = existingTx[0];
+          if (existingTx) {
+            // UPDATE existing transaction
             const clientUpdatedAt = new Date(transaction.updated_at || Date.now());
-            const serverUpdatedAt = new Date(existingTransaction.updatedAt);
+            const serverUpdatedAt = new Date(existingTx.updated_at);
 
-            if (clientUpdatedAt > serverUpdatedAt) {
-              const linesJson = JSON.stringify(transaction.lines || []);
-
-              await connection.query(
-                `UPDATE transactions SET 
-                  customer_id = ?, voucher_number = ?, provisional_voucher = ?, 
-                  date = ?, subtotal = ?, tax = ?, discount = ?, other_charges = ?, grand_total = ?, 
-                  item_count = ?, unit_count = ?, payment_type = ?, status = ?, receipt_path = ?, 
-                  lines = ?, updatedAt = ?
-                 WHERE _id = ? AND user_id = ?`,
-                [
-                  transaction.customer_id, transaction.voucher_number || existingTransaction.voucher_number, transaction.provisional_voucher,
-                  new Date(transaction.date || existingTransaction.date), transaction.subtotal, transaction.tax, transaction.discount, transaction.other_charges, transaction.grand_total,
-                  transaction.item_count, transaction.unit_count, transaction.payment_type, transaction.status, transaction.receipt_path,
-                  linesJson, clientUpdatedAt,
-                  transactionId, userId
-                ]
+            if (clientUpdatedAt >= serverUpdatedAt) {
+              await Transaction.updateOne(
+                { _id: transactionId, user_id: userId },
+                {
+                  $set: {
+                    customer_id: transaction.customer_id || null,
+                    voucher_number: transaction.voucher_number || existingTx.voucher_number,
+                    provisional_voucher: transaction.provisional_voucher || null,
+                    date: new Date(transaction.date || existingTx.date),
+                    subtotal: transaction.subtotal || 0,
+                    tax: transaction.tax || 0,
+                    discount: transaction.discount || 0,
+                    other_charges: transaction.other_charges || 0,
+                    grand_total: transaction.grand_total || 0,
+                    item_count: transaction.item_count || 0,
+                    unit_count: transaction.unit_count || 0,
+                    payment_type: transaction.payment_type || 'cash',
+                    status: transaction.status || 'completed',
+                    receipt_path: transaction.receipt_path || transaction.receipt_file_path || null,
+                    line_items: transaction.lines || [],
+                    updated_at: clientUpdatedAt,
+                    deleted_at: null
+                  }
+                },
+                { session }
               );
 
               results.transactions.synced.push({
                 id: transaction.id,
                 cloud_id: transactionId,
-                voucher_number: existingTransaction.voucher_number
+                voucher_number: existingTx.voucher_number,
+                action: 'updated'
+              });
+            } else {
+              results.transactions.conflicts.push({
+                id: transaction.id,
+                reason: 'Server version is newer'
               });
             }
           } else {
-            // Generate voucher number
+            // CREATE new transaction - generate voucher number
             let voucherNumber = transaction.voucher_number;
             if (!voucherNumber || transaction.provisional_voucher) {
               const today = new Date();
               const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
 
-              const [users] = await connection.query('SELECT company FROM users WHERE _id = ?', [userId]);
-              const companyCode = users[0]?.company?.substring(0, 3).toUpperCase() || 'GUR';
+              const user = await User.findById(userId).session(session);
+              const companyCode = user?.company?.substring(0, 3).toUpperCase() || 'GUR';
 
-              const [lastTx] = await connection.query(
-                'SELECT voucher_number FROM transactions WHERE user_id = ? AND voucher_number LIKE ? ORDER BY voucher_number DESC LIMIT 1',
-                [userId, `%-${dateStr}-%`]
-              );
+              const lastTx = await Transaction.findOne({
+                user_id: userId,
+                voucher_number: { $regex: new RegExp(`-${dateStr}-`) },
+                deleted_at: null
+              }).sort({ voucher_number: -1 }).session(session);
 
               let sequence = 1;
-              if (lastTx.length > 0) {
-                const lastVoucher = lastTx[0].voucher_number;
+              if (lastTx) {
+                const lastVoucher = lastTx.voucher_number;
                 const lastSeq = parseInt(lastVoucher.split('-').pop());
                 sequence = lastSeq + 1;
               }
@@ -259,32 +375,37 @@ export const pushChanges = async (req, res) => {
               voucherNumber = `${companyCode}-${dateStr}-${sequence.toString().padStart(4, '0')}`;
             }
 
-            const linesJson = JSON.stringify(transaction.lines || []);
+            await Transaction.create([{
+              _id: transactionId,
+              user_id: userId,
+              customer_id: transaction.customer_id || null,
+              voucher_number: voucherNumber,
+              provisional_voucher: null,
+              date: new Date(transaction.date || Date.now()),
+              subtotal: transaction.subtotal || 0,
+              tax: transaction.tax || 0,
+              discount: transaction.discount || 0,
+              other_charges: transaction.other_charges || 0,
+              grand_total: transaction.grand_total || 0,
+              item_count: transaction.item_count || 0,
+              unit_count: transaction.unit_count || 0,
+              payment_type: transaction.payment_type || 'cash',
+              status: transaction.status || 'completed',
+              receipt_path: transaction.receipt_path || transaction.receipt_file_path || null,
+              idempotency_key: transaction.idempotency_key || `transaction-${transactionId}`,
+              line_items: transaction.lines || [],
+              created_at: new Date(transaction.created_at || Date.now()),
+              updated_at: new Date(transaction.updated_at || Date.now())
+            }], { session });
 
-            await connection.query(
-              `INSERT INTO transactions (
-                _id, user_id, customer_id, voucher_number, provisional_voucher, 
-                date, subtotal, tax, discount, other_charges, grand_total, 
-                item_count, unit_count, payment_type, status, receipt_path, 
-                idempotency_key, lines, createdAt, updatedAt
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                transactionId, userId, transaction.customer_id, voucherNumber, null,
-                new Date(transaction.date || Date.now()), transaction.subtotal, transaction.tax, transaction.discount, transaction.other_charges, transaction.grand_total,
-                transaction.item_count, transaction.unit_count, transaction.payment_type, transaction.status, transaction.receipt_path,
-                transaction.idempotency_key, linesJson,
-                new Date(transaction.created_at || Date.now()),
-                new Date(transaction.updated_at || Date.now())
-              ]
-            );
-
-            // Update inventory
-            if (transaction.lines && Array.isArray(transaction.lines)) {
+            // Update inventory for completed transactions
+            if (transaction.status === 'completed' && transaction.lines && Array.isArray(transaction.lines)) {
               for (const line of transaction.lines) {
                 if (line.item_id) {
-                  await connection.query(
-                    'UPDATE items SET inventory_qty = inventory_qty - ? WHERE _id = ? AND user_id = ?',
-                    [line.quantity || 0, line.item_id, userId]
+                  await Item.updateOne(
+                    { _id: line.item_id, user_id: userId, deleted_at: null },
+                    { $inc: { inventory_qty: -(line.quantity || 0) } },
+                    { session }
                   );
                 }
               }
@@ -293,26 +414,42 @@ export const pushChanges = async (req, res) => {
             results.transactions.synced.push({
               id: transaction.id,
               cloud_id: transactionId,
-              voucher_number: voucherNumber
+              voucher_number: voucherNumber,
+              action: 'created'
             });
           }
         } catch (err) {
+          console.error('Transaction sync error:', err);
           results.transactions.conflicts.push({ id: transaction.id, error: err.message });
         }
       }
     }
 
-    await connection.commit();
+    await session.commitTransaction();
+
+    // Update sync metadata
+    const entities = ['items', 'customers', 'transactions'];
+    for (const entity of entities) {
+      await SyncMetadata.findOneAndUpdate(
+        { user_id: userId, entity_type: entity },
+        {
+          $set: { last_sync_at: new Date() },
+          $inc: { sync_count: 1 }
+        },
+        { upsert: true, new: true }
+      );
+    }
+
     res.json({
       ...results,
       server_timestamp: new Date().toISOString()
     });
 
   } catch (error) {
-    await connection.rollback();
+    await session.abortTransaction();
     console.error('Push changes error:', error);
-    res.status(500).json({ error: 'Failed to push changes' });
+    res.status(500).json({ error: 'Failed to push changes', message: error.message });
   } finally {
-    connection.release();
+    session.endSession();
   }
 };

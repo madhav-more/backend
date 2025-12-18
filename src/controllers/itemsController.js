@@ -1,25 +1,18 @@
 import { v4 as uuidv4 } from 'uuid';
-import pool from '../config/database.js';
+import Item from '../models/Item.js';
 
 export const getItems = async (req, res) => {
   const { since } = req.query;
   const userId = req.user.userId;
 
   try {
-    let query = 'SELECT * FROM items WHERE user_id = ?';
-    const params = [userId];
+    const query = { user_id: userId };
 
     if (since) {
-      query += ' AND updated_at > ?';
-      params.push(new Date(since));
+      query.updated_at = { $gt: new Date(since) };
     }
 
-    query += ' ORDER BY updated_at ASC';
-
-    const [items] = await pool.query(query, params);
-
-    // Convert decimal strings to numbers if needed, or keep as strings for precision
-    // mysql2 returns decimals as strings by default to preserve precision
+    const items = await Item.find(query).sort({ updated_at: 1 });
 
     res.json({ items });
   } catch (error) {
@@ -36,10 +29,7 @@ export const batchUpsertItems = async (req, res) => {
     return res.status(400).json({ error: 'Items array is required' });
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     const results = {
       synced: [],
       conflicts: []
@@ -49,73 +39,74 @@ export const batchUpsertItems = async (req, res) => {
       try {
         // 1. Check for idempotency key first
         if (item.idempotency_key) {
-          const [existingIdempotency] = await connection.query(
-            'SELECT id FROM items WHERE user_id = ? AND idempotency_key = ?',
-            [userId, item.idempotency_key]
-          );
+          const existingIdempotency = await Item.findOne({
+            user_id: userId,
+            idempotency_key: item.idempotency_key
+          });
 
-          if (existingIdempotency.length > 0) {
+          if (existingIdempotency) {
             results.synced.push({
               id: item.id,
-              cloud_id: existingIdempotency[0].id
+              cloud_id: existingIdempotency._id
             });
             continue;
           }
         }
 
         // 2. Check if item exists by ID
-        // Use client-provided ID if available (for sync), otherwise generate new
         const itemId = item.id || uuidv4();
-
-        const [existingItems] = await connection.query(
-          'SELECT * FROM items WHERE user_id = ? AND id = ?',
-          [userId, itemId]
-        );
-
-        const existingItem = existingItems[0];
+        const existingItem = await Item.findOne({
+          _id: itemId,
+          user_id: userId
+        });
 
         if (existingItem) {
-          // Update existing item
-          // Conflict resolution: Last Write Wins based on updated_at
+          // Update existing item with conflict resolution (Last Write Wins)
           const clientUpdatedAt = new Date(item.updated_at || Date.now());
           const serverUpdatedAt = new Date(existingItem.updated_at);
 
           if (clientUpdatedAt > serverUpdatedAt) {
-            await connection.query(
-              `UPDATE items SET 
-                name = ?, barcode = ?, sku = ?, price = ?, unit = ?, 
-                inventory_qty = ?, category = ?, recommended = ?, image_path = ?, 
-                updated_at = ?
-               WHERE id = ? AND user_id = ?`,
-              [
-                item.name, item.barcode, item.sku, item.price, item.unit,
-                item.inventory_qty, item.category, item.recommended, item.image_path,
-                clientUpdatedAt,
-                itemId, userId
-              ]
+            await Item.updateOne(
+              { _id: itemId, user_id: userId },
+              {
+                $set: {
+                  name: item.name,
+                  barcode: item.barcode,
+                  sku: item.sku,
+                  price: item.price,
+                  unit: item.unit,
+                  inventory_qty: item.inventory_qty,
+                  category: item.category,
+                  recommended: item.recommended,
+                  image_path: item.image_path,
+                  updated_at: clientUpdatedAt
+                }
+              }
             );
           }
         } else {
           // Insert new item
-          await connection.query(
-            `INSERT INTO items (
-              id, user_id, name, barcode, sku, price, unit, 
-              inventory_qty, category, recommended, image_path, 
-              idempotency_key, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              itemId, userId, item.name, item.barcode, item.sku, item.price, item.unit,
-              item.inventory_qty, item.category, item.recommended, item.image_path,
-              item.idempotency_key,
-              new Date(item.created_at || Date.now()),
-              new Date(item.updated_at || Date.now())
-            ]
-          );
+          await Item.create({
+            _id: itemId,
+            user_id: userId,
+            name: item.name,
+            barcode: item.barcode,
+            sku: item.sku,
+            price: item.price,
+            unit: item.unit,
+            inventory_qty: item.inventory_qty,
+            category: item.category,
+            recommended: item.recommended,
+            image_path: item.image_path,
+            idempotency_key: item.idempotency_key,
+            created_at: new Date(item.created_at || Date.now()),
+            updated_at: new Date(item.updated_at || Date.now())
+          });
         }
 
         results.synced.push({
-          id: item.id, // Client ID
-          cloud_id: itemId // Server ID (same if client provided UUID)
+          id: item.id,
+          cloud_id: itemId
         });
 
       } catch (itemError) {
@@ -124,15 +115,11 @@ export const batchUpsertItems = async (req, res) => {
       }
     }
 
-    await connection.commit();
     res.json(results);
 
   } catch (error) {
-    await connection.rollback();
     console.error('Batch upsert items error:', error);
     res.status(500).json({ error: 'Failed to sync items' });
-  } finally {
-    connection.release();
   }
 };
 
@@ -143,38 +130,28 @@ export const updateItem = async (req, res) => {
 
   try {
     // Check if item exists
-    const [existing] = await pool.query('SELECT id FROM items WHERE id = ? AND user_id = ?', [id, userId]);
-    if (existing.length === 0) {
+    const existing = await Item.findOne({ _id: id, user_id: userId });
+    if (!existing) {
       return res.status(404).json({ error: 'Item not found' });
     }
 
-    // Dynamic update query
-    const fields = [];
-    const values = [];
-
     // Allowed fields
     const allowedFields = ['name', 'barcode', 'sku', 'price', 'unit', 'inventory_qty', 'category', 'recommended', 'image_path'];
+    const updateData = {};
 
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {
-        fields.push(`${field} = ?`);
-        values.push(updates[field]);
+        updateData[field] = updates[field];
       }
     }
 
-    if (fields.length === 0) {
+    if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    fields.push('updated_at = NOW()');
+    updateData.updated_at = new Date();
 
-    // Add WHERE clause params
-    values.push(id);
-    values.push(userId);
-
-    const query = `UPDATE items SET ${fields.join(', ')} WHERE id = ? AND user_id = ?`;
-
-    await pool.query(query, values);
+    await Item.updateOne({ _id: id, user_id: userId }, { $set: updateData });
 
     res.json({ success: true, message: 'Item updated successfully' });
   } catch (error) {
@@ -188,9 +165,9 @@ export const deleteItem = async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    const [result] = await pool.query('DELETE FROM items WHERE id = ? AND user_id = ?', [id, userId]);
+    const result = await Item.deleteOne({ _id: id, user_id: userId });
 
-    if (result.affectedRows === 0) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Item not found' });
     }
 
